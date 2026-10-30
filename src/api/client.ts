@@ -11,6 +11,7 @@ export class ApiError extends Error {
 }
 
 type Options = {
+  headers?: Record<string, string>;
   method?: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
   token?: string | null;
   json?: unknown;
@@ -29,7 +30,7 @@ function messageFrom(data: any, status: number): string {
 }
 
 export async function api<T = any>(path: string, opts: Options = {}): Promise<T> {
-  const headers: Record<string, string> = { Accept: 'application/json' };
+  const headers: Record<string, string> = { Accept: 'application/json', ...opts.headers };
   if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
   let body: any;
   if (opts.form) body = opts.form; // let fetch set the multipart boundary
