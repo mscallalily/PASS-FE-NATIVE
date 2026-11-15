@@ -1,0 +1,61 @@
+{
+  "expo": {
+    "name": "PASS",
+    "slug": "pass-mobile",
+    "scheme": "pass",
+    "version": "1.0.0",
+    "orientation": "default",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "ph.edu.dyci.pass",
+      "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "PASS needs access to your photos so you can upload your school ID and driver's license.",
+        "NSCameraUsageDescription": "PASS uses your camera to scan visitor QR passes and photograph documents."
+      }
+    },
+    "android": {
+      "package": "ph.edu.dyci.pass",
+      "adaptiveIcon": {
+        "backgroundColor": "#FFFFFF",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-secure-store",
+      "expo-font",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "PASS uses your camera to scan visitor QR passes and photograph documents.",
+          "recordAudioAndroid": false,
+          "barcodeScannerEnabled": true
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "PASS needs access to your photos so you can upload your school ID and driver's license.",
+          "cameraPermission": "PASS needs the camera so you can photograph your school ID and driver's license."
+        }
+      ],
+      "expo-asset",
+      "expo-status-bar",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "resizeMode": "contain",
+          "backgroundColor": "#FFFFFF"
+        }
+      ]
+    ]
+  }
+}

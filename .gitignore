@@ -1,0 +1,35 @@
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# native builds
+android/
+ios/
+*.apk
+*.aab
+*.ipa
+
+# env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.p8
+*.p12
+*.key
+*.mobileprovision
+google-services.json
+GoogleService-Info.plist
+
+# logs / OS
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+.DS_Store
+*.log
+coverage/
