@@ -1,12 +1,25 @@
 import { api, ApiError } from '../api/client';
 import type { MobileRole } from '../context/AuthContext';
+import { ageParkingMap, monotonicNow, parseParkingMapResponse } from './parkingAvailability';
+export { ageParkingMap, hasRecordedHold, monotonicNow } from './parkingAvailability';
 
 export type Point = [number, number];
-export type SlotStatus = 'available' | 'occupied' | 'maintenance';
+export type SlotStatus = 'available' | 'occupied' | 'maintenance' | 'unknown';
+export interface SlotSensor {
+  online: boolean; state: 'available' | 'occupied' | 'unknown' | 'offline';
+  distance_cm: number | null; last_seen_at: string | null;
+}
+export interface ParkingFigures {
+  capacity: number; occupied: number; available: number; maintenance?: number;
+  recorded_occupied?: number; unverified_occupied?: number; sensor_unavailable?: number;
+  occupancy_percent?: number; confirmed?: number; awaiting_confirmation?: number;
+}
+export interface ParkingMapArea extends ParkingFigures { parking_area_id: number; area_code: string; area_name: string }
 export interface MapSlot {
   slot_id: number; slot_code: string; parking_area_id: number;
   area_code: string; area_name: string; slot_status: string;
   status: SlotStatus; placed: boolean;
+  recorded_occupied?: boolean; sensor?: SlotSensor | null;
   x: number | null; y: number | null; w: number | null; h: number | null;
   rotation: number; accessible?: boolean;
   occupant?: null | {
@@ -41,12 +54,14 @@ export interface ParkingMapData {
   slots: MapSlot[];
   extra_bays: { area: string; x: number; y: number; w: number; h: number; rotation: number; label: string; kind: string; note?: string | null }[];
   measured_layout?: { geometry: MapGeometry; positions: Record<string, { x: number; y: number; w: number; h: number; rotation: number }> };
-  areas?: { parking_area_id: number; area_code: string; area_name: string; capacity: number; occupied: number; available: number; maintenance?: number }[];
-  overall?: { capacity: number; occupied: number; available: number };
+  areas?: ParkingMapArea[];
+  overall?: ParkingFigures;
   gate?: { gate_code: string; gate_name: string; gate_status: string };
   ambiguities?: string[];
   corrections?: string[];
   generated_at?: string;
+  /** Internal monotonic request clock; never taken from API payload data. */
+  clientRequestedAt?: number;
   /** True only when Laravel allowed the privileged /parking/map contract. */
   hasStaffDetails?: boolean;
 }
@@ -113,27 +128,38 @@ export function withMeasuredLayout(raw: ParkingMapData): ParkingMapData {
 }
 
 export function slotColors(slot: MapSlot) {
+  if (slot.status === 'unknown') return { fill: '#F59E0B', outline: '#92400E', label: '#111827' };
   if (slot.status === 'maintenance') return { fill: '#9CA3AF', outline: '#6B7280', label: '#FFFFFF' };
   if (slot.status === 'occupied') return { fill: '#EF4444', outline: slot.occupant?.confirmed === false ? '#FFFFFF' : '#B91C1C', label: '#FFFFFF' };
   return { fill: '#22C55E', outline: '#15803D', label: '#FFFFFF' };
 }
 
+/** Parse and age each response using the clock from its own HTTP attempt. */
+async function requestParkingMap(token: string, staff: boolean, signal?: AbortSignal): Promise<ParkingMapData> {
+  if (signal?.aborted) throw new ApiError('Request cancelled.', 0, {}, 'cancelled');
+  const clientRequestedAt = monotonicNow();
+  const response = await api<unknown>(staff ? '/parking/map' : '/parking/availability-map', { token, signal });
+  if (signal?.aborted) throw new ApiError('Request cancelled.', 0, {}, 'cancelled');
+  const parsed = parseParkingMapResponse(response, staff);
+  verifyWebMeasuredLayout(parsed);
+  return ageParkingMap(withMeasuredLayout({ ...parsed, clientRequestedAt }), monotonicNow());
+}
+
+/** This path stays public even when an administrator requests a home summary. */
+export function getPublicParkingMap(token: string, signal?: AbortSignal): Promise<ParkingMapData> {
+  return requestParkingMap(token, false, signal);
+}
+
 /** Privileged records include identities; the general map deliberately does not. */
-export async function getParkingMap(token: string, role: MobileRole): Promise<ParkingMapData> {
+export async function getParkingMap(token: string, role: MobileRole, signal?: AbortSignal): Promise<ParkingMapData> {
   if (STAFF_ROLES.includes(role)) {
-    try {
-      const privileged = await api<ParkingMapData>('/parking/map', { token });
-      if (!Array.isArray(privileged.slots)) throw new Error('Invalid parking map response.');
-      verifyWebMeasuredLayout(privileged);
-      return withMeasuredLayout({ ...privileged, hasStaffDetails: true });
-    } catch (error) {
+    try { return await requestParkingMap(token, true, signal); }
+    catch (error) {
       // Role assignments can differ between frontend and Laravel; a 403
       // must degrade to the public availability map, never bypass access.
+      if (signal?.aborted) throw new ApiError('Request cancelled.', 0, {}, 'cancelled');
       if (!(error instanceof ApiError) || error.status !== 403) throw error;
     }
   }
-  const availability = await api<ParkingMapData>('/parking/availability-map', { token });
-  if (!Array.isArray(availability.slots) || !availability.geometry) throw new Error('Invalid parking layout response.');
-  verifyWebMeasuredLayout(availability);
-  return withMeasuredLayout({ ...availability, hasStaffDetails: false });
+  return getPublicParkingMap(token, signal);
 }

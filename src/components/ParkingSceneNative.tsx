@@ -270,7 +270,7 @@ export const ParkingScene3DNative=memo(function ParkingScene3DNative({data,area,
       const c=slotColors(s);
       const corners=slotRect(s.x!,s.y!,s.w!,s.h!,s.rotation);
       return <G key={`stall-${s.slot_id}`} onPress={()=>onSelect(s)} accessible accessibilityLabel={`Slot ${s.slot_code}, ${s.status}`}>
-        <Polygon points={poly(lift(slotRect(s.x!,s.y!,Math.max(0.2,s.w!-1),Math.max(0.2,s.h!-1),s.rotation),PAVE))} fill={c.fill} fillOpacity={s.status==='maintenance'?0.75:0.6}/>
+        <Polygon points={poly(lift(slotRect(s.x!,s.y!,Math.max(0.2,s.w!-1),Math.max(0.2,s.h!-1),s.rotation),PAVE))} fill={c.fill} fillOpacity={s.status==='maintenance'||s.status==='unknown'?0.75:0.6}/>
         <Polygon points={poly(lift(corners,PAVE))} fill="none" stroke={selectedId===s.slot_id?'#FACC15':'#FFFFFF'} strokeWidth={selectedId===s.slot_id?1.1:0.45}/>
         {s.status==='occupied'&&s.occupant?.confirmed===false&&<Polygon points={poly(lift(corners,PAVE))} fill="none" stroke="#FFFFFF" strokeWidth={0.5} strokeDasharray="1.2 0.8"/>}
         {s.accessible&&!s.occupant&&<G><Rect x={project3D([s.x!,s.y!],PAVE)[0]-4} y={project3D([s.x!,s.y!],PAVE)[1]-0.5} width={8} height={6.4} rx={1} fill="#2563EB"/>
@@ -302,7 +302,7 @@ export const ParkingScene3DNative=memo(function ParkingScene3DNative({data,area,
       const occupied=!!s.occupant,mc=s.area_code==='MC';
       const [x,y]=project3D([s.x!,s.y!],PAVE+(occupied?(mc?6.6:8.8):s.status==='maintenance'?5.4:0.1));
       const label=String(Number(s.slot_code.split('-').pop()??s.slot_code));
-      const plate=showPlates&&s.occupant?s.occupant.plate_number:null;
+      const plate=showPlates&&data.hasStaffDetails&&s.occupant?s.occupant.plate_number:null;
       const w=Math.max(label.length*fs*0.62+2.4,plate?plate.length*fs*0.32+2:0),h=fs+(plate?fs*0.6:0)+1.2;
       return <G key={`number-${s.slot_id}`} onPress={()=>onSelect(s)}>
         {occupied?<G>
@@ -382,7 +382,7 @@ export const ParkingPlanNative=memo(function ParkingPlanNative({data,area,select
         <Polygon points={draw(p)} fill={color.fill} stroke={selectedId===s.slot_id?'#080677':color.outline} strokeWidth={selectedId===s.slot_id?1.4:0.5} strokeDasharray={s.occupant?.confirmed===false?'1.2 0.8':undefined}/>
         <G transform={`translate(${s.x!} ${s.y!}) rotate(${s.rotation})`}>
           <SvgText transform={`rotate(${angle})`} y={fs*0.32} fontSize={fs} fontWeight="bold" fill="#FFFFFF" textAnchor="middle">{s.accessible?'♿ ':''}{String(Number(s.slot_code.split('-').pop()??s.slot_code))}</SvgText>
-          {showPlates&&s.occupant&&<SvgText transform={`rotate(${angle})`} y={fs*0.9} fontSize={2.3} fill="#FFFFFF" textAnchor="middle">{s.occupant.plate_number}</SvgText>}
+          {showPlates&&data.hasStaffDetails&&s.occupant&&<SvgText transform={`rotate(${angle})`} y={fs*0.9} fontSize={2.3} fill="#FFFFFF" textAnchor="middle">{s.occupant.plate_number}</SvgText>}
         </G>
         {s.incident&&<G><Circle cx={s.x!+s.w!/2-1} cy={s.y!-s.h!/2+1} r={2.4} fill="#F59E0B" stroke="#FFFFFF" strokeWidth={0.4}/><SvgText x={s.x!+s.w!/2-1} y={s.y!-s.h!/2+2.2} textAnchor="middle" fontSize={3.2} fill="#FFFFFF">!</SvgText></G>}
       </G>;

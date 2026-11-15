@@ -16,6 +16,18 @@ const response = (data: unknown, status = 200) => ({ ok: status < 400, status, j
 beforeEach(() => { (global as any).fetch = jest.fn(); });
 
 describe('ID autofill, email and read-only license registration', () => {
+  it('keeps office aliases out of the college picker while retaining a real college', async () => {
+    const departments = ['Engineering', 'security  office', ' HR Department ', 'IT\tDepartment', 'Registrar\u00A0Office'].map((name, i) => ({ department_id: i + 1, department_code: 'QA' + i, department_name: name }));
+    (global.fetch as jest.Mock).mockImplementation((url: string) => Promise.resolve(response(url.endsWith('/departments') ? { data: departments } : {
+      data: { status: 'passed', message: 'ID read.', fields: { first_name: 'MARIA ELENA', last_name: 'DELA CRUZ', middle_initial: 'S.', suffix: '', user_code: '2026-01234' }, profile_fields: {}, receipt: 'signed-receipt' },
+    })));
+    await render(<RegistrationForm onBackToLogin={() => {}} />);
+    await fireEvent.press(screen.getByText('Take ID photo'));
+    await waitFor(() => expect(screen.getByText('MARIA ELENA')).toBeTruthy());
+    await fireEvent.press(screen.getByText('Select'));
+    expect(screen.getByText('Engineering')).toBeTruthy();
+    for (const department of departments.slice(1)) expect(screen.queryByText(department.department_name)).toBeNull();
+  });
   it('uses the same ID-first four steps as the website', () => {
     expect(REGISTRATION_STEPS).toEqual(['Institutional ID', 'Verify email', 'Driver’s license', 'Review & create']);
   });

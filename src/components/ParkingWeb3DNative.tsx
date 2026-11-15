@@ -16,7 +16,7 @@ import Svg, { Circle, G, Line, Polygon, Rect, Text as SvgText } from 'react-nati
 import { Canvas, useThree } from '@react-three/fiber/native';
 import * as THREE from 'three';
 import { Maximize2, ZoomIn, ZoomOut } from 'lucide-react-native';
-import type { MapSlot, ParkingMapData, Point } from '../services/parkingMap';
+import { hasRecordedHold, slotColors, type MapSlot, type ParkingMapData, type Point } from '../services/parkingMap';
 import { C } from '../theme';
 import { T } from './ui';
 
@@ -319,13 +319,13 @@ function ParkingStall({ slot, selected, onSelect }: { slot: MapSlot; selected: b
   const corners = useMemo(()=>bay(slot.x!,slot.y!,slot.w!-0.9,slot.h!-0.9,slot.rotation),[slot.x,slot.y,slot.w,slot.h,slot.rotation]);
   const geo = useMemo(()=>flat(corners,TINT),[corners]);
   useEffect(()=>()=>geo.dispose(),[geo]);
-  const color = slot.status==='occupied'?'#EF4444':slot.status==='maintenance'?'#A3A9B3':'#22C55E';
+  const color = slotColors(slot).fill;
   return <group>
     <mesh geometry={geo} onClick={(e)=>{e.stopPropagation();onSelect(slot);}}>
-      <meshStandardMaterial color={selected?'#FACC15':color} transparent opacity={selected?0.85:slot.status==='maintenance'?0.88:slot.status==='occupied'?0.8:0.78}
+      <meshStandardMaterial color={selected?'#FACC15':color} transparent opacity={selected?0.85:slot.status==='maintenance'?0.88:slot.status==='unknown'?0.84:slot.status==='occupied'?0.8:0.78}
         polygonOffset polygonOffsetFactor={-1} polygonOffsetUnits={-1} depthWrite={false} roughness={0.85} side={THREE.DoubleSide}/>
     </mesh>
-    {slot.status==='occupied' && slot.occupant && <group onClick={(e)=>{e.stopPropagation();onSelect(slot);}}>
+    {slot.status==='occupied' && hasRecordedHold(slot) && <group onClick={(e)=>{e.stopPropagation();onSelect(slot);}}>
       {slot.area_code==='MC'?<MotorcycleModel slot={slot}/>:<CarModel slot={slot}/>}</group>}
     {slot.status==='maintenance' && <group onClick={e=>{e.stopPropagation();onSelect(slot);}}><MaintenanceCone slot={slot}/></group>}
   </group>;
@@ -445,18 +445,18 @@ function Labels({ data, pose, width, height, area, onGate, onSelect }: {
         from making bays appear missing, without introducing new positions. */}
     {data.slots.filter(s=>s.placed&&s.x!==null&&s.y!==null&&s.w!==null&&s.h!==null).map(s=>{
       const footprint = bay(s.x!,s.y!,s.w!,s.h!,s.rotation).map(p=>screen(p[0],TINT+0.08,p[1]));
-      const at=screen(s.x!,ASPHALT_TOP+(s.status==='occupied'?s.area_code==='MC'?10:13:0.4),s.y!);
+      const at=screen(s.x!,ASPHALT_TOP+(s.status==='occupied'&&hasRecordedHold(s)?s.area_code==='MC'?10:13:0.4),s.y!);
       // Do not cull from a centre-only test: long car bays can cross the edge.
       if(footprint.every(p => p[0]<-30) || footprint.every(p=>p[0]>width+30) ||
          footprint.every(p=>p[1]<-30) || footprint.every(p=>p[1]>height+30))return null;
       const size=Math.max(5,Math.min(17,500/pose.distance*Math.min(s.w!,s.h!)));
       const label=String(Number(s.slot_code.split('-').pop()??s.slot_code));
       const polygonPoints=footprint.map(p=>`${p[0].toFixed(2)},${p[1].toFixed(2)}`).join(' ');
-      const fill = s.status==='maintenance'?'#9CA3AF':s.status==='occupied'?'#EF4444':'#22C55E';
+      const fill = slotColors(s).fill;
       return <G key={s.slot_id}>
-        <Polygon points={polygonPoints} fill={fill} fillOpacity={0.53} stroke="#FFFFFF" strokeWidth={Math.max(0.42,Math.min(1.0,width/750))} onPress={()=>onSelect(s)}/>
-        {s.status==='occupied'&&<Rect x={at[0]-size*0.7} y={at[1]-size} width={size*1.4} height={size*1.3} rx={2} fill="#DC2626" stroke="#FFFFFF" strokeWidth={0.5}/>}
-        <SvgText x={at[0]} y={at[1]} fontSize={size} fill="#FFFFFF" fontWeight="bold" textAnchor="middle" stroke="#27313E" strokeWidth={0.15}>{label}</SvgText>
+        <Polygon points={polygonPoints} fill={fill} fillOpacity={0.53} stroke={s.status==='unknown'?slotColors(s).outline:'#FFFFFF'} strokeDasharray={s.status==='unknown'?'2 1':undefined} strokeWidth={Math.max(0.42,Math.min(1.0,width/750))} onPress={()=>onSelect(s)}/>
+        {s.status==='occupied'&&hasRecordedHold(s)&&<Rect x={at[0]-size*0.7} y={at[1]-size} width={size*1.4} height={size*1.3} rx={2} fill="#DC2626" stroke="#FFFFFF" strokeWidth={0.5}/>}
+        <SvgText x={at[0]} y={at[1]} fontSize={size} fill={slotColors(s).label} fontWeight="bold" textAnchor="middle" stroke={s.status==='unknown'?'none':'#27313E'} strokeWidth={0.15}>{label}</SvgText>
       </G>;
     })}
     {data.geometry.areas.filter(a=>area==='ALL'||area===a.area).map(a=>{

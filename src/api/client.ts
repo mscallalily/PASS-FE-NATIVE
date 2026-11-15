@@ -1,71 +1,125 @@
 import { API_URL } from '../config';
-
 export class ApiError extends Error {
-  status: number;
-  errors: Record<string, string[]>;
-  constructor(message: string, status: number, errors: Record<string, string[]> = {}) {
-    super(message);
-    this.status = status;
-    this.errors = errors;
-  }
+    constructor(message: string, public status: number, public errors: Record<string, string[]> = {}, public code = '') {
+        super(message);
+        this.name = 'ApiError';
+    }
 }
-
-type Options = {
-  headers?: Record<string, string>;
-  method?: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
-  token?: string | null;
-  json?: unknown;
-  form?: FormData;
-  signal?: AbortSignal;
-  timeoutMs?: number;
+export type ApiOptions = {
+    headers?: Record<string, string>;
+    method?: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
+    token?: string | null;
+    json?: unknown;
+    form?: FormData;
+    signal?: AbortSignal;
+    timeoutMs?: number;
 };
-
-/** Flatten Laravel validation errors ({errors: {field: [msg]}}) into one readable message. */
-function messageFrom(data: any, status: number): string {
-  if (data?.errors && typeof data.errors === 'object') {
-    const all = (Object.values(data.errors) as string[][]).flat();
-    if (all.length) return all.join(' ');
-  }
-  return data?.message || `Request failed with status ${status}.`;
+const listeners = new Set<(token: string) => void>();
+export function onInvalidSession(listener: (token: string) => void): () => void {
+    listeners.add(listener);
+    return () => {
+        listeners.delete(listener);
+    };
 }
-
-export async function api<T = any>(path: string, opts: Options = {}): Promise<T> {
-  const headers: Record<string, string> = { Accept: 'application/json', ...opts.headers };
-  if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
-  let body: any;
-  if (opts.form) body = opts.form; // let fetch set the multipart boundary
-  else if (opts.json !== undefined) {
-    headers['Content-Type'] = 'application/json';
-    body = JSON.stringify(opts.json);
-  }
-
-  const controller = new AbortController();
-  const abort = () => controller.abort();
-  if (opts.signal?.aborted) controller.abort();
-  opts.signal?.addEventListener('abort', abort, { once: true });
-  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? (opts.form ? 110000 : 30000));
-  let res: Response;
-  try {
-    res = await fetch(`${API_URL}/api${path}`, {
-      method: opts.method ?? (body ? 'POST' : 'GET'),
-      headers,
-      body,
-      signal: controller.signal,
+function invalid(token: string | null | undefined, status: number, code: string) {
+    if (token && (status === 401 || status === 403 && ['account_not_active', 'email_unverified'].includes(code)))
+        for (const listener of listeners)
+            listener(token);
+}
+function aborted() {
+    const error = new Error('Aborted');
+    error.name = 'AbortError';
+    return error;
+}
+async function request<T>(path: string, opts: ApiOptions, read: (r: Response) => Promise<T>): Promise<T> {
+    const headers: Record<string, string> = {
+        Accept: 'application/json', ...opts.headers
+    };
+    if (opts.token)
+        headers.Authorization = `Bearer ${opts.token}`;
+    let body: FormData | string | undefined;
+    if (opts.form)
+        body = opts.form;
+    else if (opts.json !== undefined) {
+        headers['Content-Type'] = 'application/json';
+        body = JSON.stringify(opts.json);
+    }
+    const method = opts.method ?? (body ? 'POST' : 'GET');
+    const uncertain = method === 'GET' ? '' : ' Check whether the change was saved before trying again.';
+    const controller = new AbortController();
+    let timedOut = false;
+    let rejectAbort: (() => void) | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+        rejectAbort = () => reject(aborted());
+        controller.signal.addEventListener('abort', rejectAbort, {
+            once: true
+        });
     });
-  } catch (e) {
-    // Include the underlying reason so connection problems can be diagnosed (timeout vs. refused vs. upload failure).
-    const reason = e instanceof Error ? (e.name === 'AbortError' ? 'timed out' : e.message) : String(e);
-    if (opts.signal?.aborted) throw new ApiError('Request cancelled.', 0);
-    throw new ApiError(
-      `Cannot reach the PASS server at ${API_URL}. Check your connection and EXPO_PUBLIC_API_URL. (${reason})`,
-      0,
-    );
-  } finally {
-    clearTimeout(timer);
-    opts.signal?.removeEventListener('abort', abort);
-  }
-
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new ApiError(messageFrom(data, res.status), res.status, data?.errors ?? {});
-  return data as T;
+    const abort = () => controller.abort();
+    opts.signal?.addEventListener('abort', abort, {
+        once: true
+    });
+    if (opts.signal?.aborted)
+        abort();
+    const timer = setTimeout(() => {
+        timedOut = true;
+        abort();
+    }, opts.timeoutMs ?? (opts.form ? 120000 : 30000));
+    try {
+        const response = (async () => {
+            if (controller.signal.aborted)
+                throw aborted();
+            const res = await fetch(`${API_URL}/api${path}`, {
+                method, headers, body, signal: controller.signal
+            });
+            if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                if (controller.signal.aborted)
+                    throw aborted();
+                const code = typeof data?.code === 'string' ? data.code : 'http_error';
+                invalid(opts.token, res.status, code);
+                const fields = Object.values(data?.errors ?? {}).flatMap(value => Array.isArray(value) ? value.filter(v => typeof v === 'string') : []);
+                throw new ApiError(fields.length ? fields.join(' ') : typeof data?.message === 'string' ? data.message : `Request failed with status ${res.status}.`, res.status, data?.errors ?? {}, code);
+            }
+            return read(res);
+        })();
+        return await Promise.race([response, deadline]);
+    }
+    catch (error) {
+        if (opts.signal?.aborted)
+            throw new ApiError('Request cancelled.', 0, {}, 'cancelled');
+        if (timedOut)
+            throw new ApiError('PASS took too long to respond.' + uncertain + ' Please try again when your connection is stable.', 0, {}, 'request_timeout');
+        if (error instanceof ApiError)
+            throw error;
+        throw new ApiError(`Cannot reach the PASS server at ${API_URL}. Check your connection.` + uncertain, 0, {}, 'network_error');
+    }
+    finally {
+        clearTimeout(timer);
+        opts.signal?.removeEventListener('abort', abort);
+        if (rejectAbort)
+            controller.signal.removeEventListener('abort', rejectAbort);
+    }
+}
+export async function api<T = any>(path: string, opts: ApiOptions = {}): Promise<T> {
+    return request(path, opts, async (response) => {
+        if ([204, 205].includes(response.status))
+            return undefined as T;
+        try {
+            if (response.headers && !/^application\/(?:json|[a-z0-9.+-]+\+json)(?:\s*;|$)/i.test(response.headers.get('content-type') ?? ''))
+                throw new Error('Not JSON');
+            const data = await response.json();
+            if (data === null || typeof data !== 'object')
+                throw new Error('Invalid API shape');
+            return data as T;
+        }
+        catch {
+            throw new ApiError('PASS returned an incomplete or unexpected response. Check whether any submitted change was saved before trying again.', response.status, {}, 'invalid_response');
+        }
+    });
+}
+export async function apiBlob(path: string, opts: ApiOptions = {}): Promise<Blob> {
+    return request(path, {
+        ...opts, timeoutMs: opts.timeoutMs ?? 60000
+    }, response => response.blob());
 }

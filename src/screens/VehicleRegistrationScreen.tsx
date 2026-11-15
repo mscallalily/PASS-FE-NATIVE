@@ -1,166 +1,287 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Image, View } from 'react-native';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ActivityIndicator, Pressable, View } from 'react-native';
 import { CheckCircle, RefreshCw } from 'lucide-react-native';
 import { api, ApiError } from '../api/client';
 import { toUploadFile } from '../api/upload';
 import { Select } from '../components/Select';
-import { Btn, Card, Field, FileUpload, Frame, PickedFile, T } from '../components/ui';
+import { Btn, Card, Field, FileUpload, Frame, type PickedFile, T } from '../components/ui';
+import VehicleDocumentReview from '../components/VehicleDocumentReview';
 import { useAuth } from '../context/AuthContext';
 import { useLicense } from '../context/LicenseContext';
+import { combineReadings, DOCUMENT_DETAILS, DETAIL_LABEL, EMPTY_DETAILS, reviewStatus, sourceOf, type Reading, type VehicleDetails } from '../services/orcrReview';
+import { photoProblem, vehicleBody } from '../services/vehicleRegistration';
+import { campusToday } from '../services/rfid';
 import { C } from '../theme';
 import { NavyHeader } from './shared';
-
+import { AdminPager } from '../components/AdminWorkspace';
+import { listMeta, listPath, type ListMeta } from '../services/listPage';
 type Vehicle = {
-  id?: number | string; vehicle_id?: number; plate?: string; plate_number?: string;
-  type?: string; vehicle_type?: string; make?: string; model?: string; color?: string;
-  rfid?: string | null; status?: string; authorization_status?: string | null;
-  registrationStatus?: string; selectedForUse?: boolean; switchLocked?: boolean; hasPhoto?: boolean;
-  canResubmit?: boolean; year?: number | string; rejectionReason?: string | null;
+    id?: number | string;
+    vehicle_id?: number;
+    plate?: string;
+    plate_number?: string;
+    make?: string;
+    model?: string;
+    color?: string;
+    rfid?: string | null;
+    rfidStatus?: string | null;
+    status?: string;
+    authorization_status?: string | null;
+    registrationStatus?: string;
+    selectedForUse?: boolean;
+    switchLocked?: boolean;
+    canResubmit?: boolean;
+    rejectionReason?: string | null;
+    documentCheck?: {
+        status: string;
+        reasons?: string[];
+    } | null;
 };
-const VEHICLE_TYPES = ['Sedan', 'SUV', 'Hatchback', 'Pickup', 'Motorcycle', 'Van'];
-const EMPTY = { plate_number: '', vehicle_type: '', year_model: '', make: '', model: '', color: '' };
-
+const TYPES = ['Sedan', 'SUV', 'Hatchback', 'Pickup', 'Motorcycle', 'Van'];
 export default function VehicleRegistrationScreen() {
-  const { token } = useAuth();
-  const { status: licenseStatus } = useLicense();
-  const [vehicles, setVehicles] = useState<Vehicle[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [notice, setNotice] = useState('');
-  const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState(EMPTY);
-  const [photo, setPhoto] = useState<PickedFile | null>(null);
-  const [resubmittingId, setResubmittingId] = useState<string | null>(null);
-  const [replacementId, setReplacementId] = useState<string | null>(null);
-  const [replacementPhoto, setReplacementPhoto] = useState<PickedFile | null>(null);
-
-  const load = useCallback(async () => {
-    if (!token) return;
-    setLoading(true); setError('');
-    try {
-      const result = await api<{ vehicles?: Vehicle[] }>('/vehicles', { token });
-      if (!Array.isArray(result.vehicles)) throw new Error('The server returned an invalid vehicle list.');
-      setVehicles(result.vehicles);
-    } catch (e) {
-      // Older deployments expose the authorization list but not the current owner's vehicle list.
-      if (e instanceof ApiError && e.status === 404) {
+    const { token } = useAuth(), { status: licenseStatus, submission } = useLicense();
+    const licenseEligible = licenseStatus === 'verified' && !!submission?.expiry_date && submission.expiry_date.slice(0, 10) >= campusToday();
+    const [vehicles, setVehicles] = useState<Vehicle[]>([]), [busy, setBusy] = useState(false), [loading, setLoading] = useState(false), [error, setError] = useState(''), [notice, setNotice] = useState(''), [showForm, setShowForm] = useState(false);
+    const [page, setPage] = useState(1), [meta, setMeta] = useState<ListMeta | null>(null), [search, setSearch] = useState(''), [appliedSearch, setAppliedSearch] = useState(''), [selectedPlate, setSelectedPlate] = useState('');
+    const [photo, setPhoto] = useState<PickedFile | null>(null), [orFile, setOrFile] = useState<PickedFile | null>(null), [crFile, setCrFile] = useState<PickedFile | null>(null), [or, setOr] = useState<Reading | null>(null), [cr, setCr] = useState<Reading | null>(null);
+    const [edits, setEdits] = useState<Partial<VehicleDetails>>({}), [checked, setChecked] = useState<Partial<VehicleDetails>>({}), [resubmittingId, setResubmittingId] = useState<string | null>(null), [replacementId, setReplacementId] = useState<string | null>(null), [replacementPhoto, setReplacementPhoto] = useState<PickedFile | null>(null);
+    const lock = useRef(false), loadRequest = useRef<AbortController | null>(null), alive = useRef(true);
+    useEffect(() => {
+        alive.current = true;
+        return () => {
+            alive.current = false;
+            loadRequest.current?.abort();
+        };
+    }, []);
+    const combined = useMemo(() => combineReadings(or, cr), [or, cr]);
+    const form = Object.fromEntries(DOCUMENT_DETAILS.map(key => [key, edits[key] ?? combined[key].value ?? EMPTY_DETAILS[key]])) as VehicleDetails;
+    const reviewInput = {
+        or, cr, hasOr: !!orFile, hasCr: !!crFile, combined, details: form, edits, checked
+    }, review = reviewStatus(reviewInput);
+    const load = useCallback(async () => {
+        if (!token)
+            return;
+        loadRequest.current?.abort();
+        const request = new AbortController();
+        loadRequest.current = request;
+        setLoading(true);
         try {
-          const fallback = await api<{ data: Vehicle[] }>('/vehicles/my-authorizations', { token });
-          setVehicles(fallback.data ?? []);
-          setNotice('This server uses the older vehicle API. Uploading, selecting, and registering vehicles requires the updated PASS backend.');
-        } catch (fallbackError) { setError(fallbackError instanceof Error ? fallbackError.message : 'Unable to load vehicles.'); }
-      } else setError(e instanceof Error ? e.message : 'Unable to load vehicles.');
-    } finally { setLoading(false); }
-  }, [token]);
-  useEffect(() => { void load(); }, [load]);
-
-  const register = async () => {
-    if (!token || busy) return;
-    if (!photo || !/^image\/(jpeg|png)$/.test(photo.type)) { setError('A JPG/PNG photo showing the vehicle plate is required.'); return; }
-    if (!form.plate_number.trim() || !form.vehicle_type || !form.make.trim() || !form.model.trim() || !form.color.trim()) {
-      setError('Complete the plate, type, make, model, and color.'); return;
+            const result = await api<{
+                vehicles: Vehicle[];
+                meta?: ListMeta; selected_vehicle?: { plate_number: string } | null;
+            }>(listPath('/vehicles', page, { search: appliedSearch }), {
+                token, signal: request.signal
+            });
+            if (!Array.isArray(result.vehicles))
+                throw new Error('PASS returned an invalid vehicle list. Refresh and try again.');
+            if (!request.signal.aborted && alive.current) {
+                const info = listMeta(result.meta, result.vehicles.length); setMeta(info);
+                setVehicles(result.vehicles);
+                setSelectedPlate(result.selected_vehicle?.plate_number ?? result.vehicles.find(v => v.selectedForUse)?.plate ?? '');
+                if (page > info.last_page) setPage(info.last_page);
+            }
+        }
+        catch (e) {
+            if (!request.signal.aborted && alive.current)
+                setError(e instanceof ApiError && e.status === 404 ? 'This server needs the current PASS vehicle registration API.' : e instanceof Error ? e.message : 'Unable to load vehicles.');
+        }
+        finally {
+            if (!request.signal.aborted && alive.current)
+                setLoading(false);
+        }
+    }, [token, page, appliedSearch]);
+    useEffect(() => {
+        void load();
+        return () => loadRequest.current?.abort();
+    }, [load]);
+    const processing = vehicles.some(v => v.documentCheck?.status === 'processing');
+    useEffect(() => {
+        if (!processing)
+            return;
+        const timer = setInterval(() => {
+            if (!lock.current)
+                void load();
+        }, 5000);
+        return () => clearInterval(timer);
+    }, [processing, load]);
+    const reset = () => {
+        setOrFile(null);
+        setCrFile(null);
+        setOr(null);
+        setCr(null);
+        setPhoto(null);
+        setEdits({});
+        setChecked({});
+        setError('');
+    };
+    const choose = (kind: 'OR' | 'CR', file: PickedFile | null) => {
+        if (lock.current)
+            return;
+        const problem = file && photoProblem(file, kind);
+        if (problem) {
+            setError(problem);
+            return;
+        }
+        setEdits({});
+        setChecked({});
+        setError('');
+        if (kind === 'OR') {
+            setOrFile(file);
+            setOr(null);
+        }
+        else {
+            setCrFile(file);
+            setCr(null);
+        }
+    };
+    async function write(work: () => Promise<void>) {
+        if (lock.current || !token)
+            return;
+        lock.current = true;
+        setBusy(true);
+        setError('');
+        setNotice('');
+        try {
+            await work();
+        }
+        catch (e) {
+            if (alive.current)
+                setError(e instanceof Error ? e.message : 'The change could not be completed.');
+        }
+        finally {
+            lock.current = false;
+            if (alive.current)
+                setBusy(false);
+        }
     }
-    if (form.year_model && (!/^\d{4}$/.test(form.year_model) || Number(form.year_model) > new Date().getFullYear() + 1)) {
-      setError('Enter a valid model year.'); return;
-    }
-    setBusy(true); setError(''); setNotice('');
-    try {
-      const body = new FormData();
-      for (const [key, value] of Object.entries(form)) if (value) body.append(key, key === 'plate_number' ? value.trim().toUpperCase() : value.trim());
-      body.append('vehicle_photo', toUploadFile(photo) as any);
-      const result = await api<{ message?: string }>(resubmittingId ? `/vehicles/${resubmittingId}/resubmit` : '/vehicles', { token, method: 'POST', form: body, timeoutMs: 65000 });
-      setNotice(result.message || 'Vehicle registration submitted for staff review.');
-      setShowForm(false); setResubmittingId(null); setForm(EMPTY); setPhoto(null);
-      await load();
-    } catch (e) { setError(e instanceof Error ? e.message : 'Could not register vehicle.'); }
-    finally { setBusy(false); }
-  };
-
-  const selectForUse = async (vehicle: Vehicle) => {
-    if (!token || busy) return;
-    const id = vehicle.id ?? vehicle.vehicle_id;
-    if (!id) return;
-    setBusy(true); setError('');
-    try {
-      const result = await api<{ message?: string }>(`/vehicles/${id}/select-for-use`, { token, method: 'POST' });
-      setNotice(result.message || 'Your selected vehicle was updated.');
-      await load();
-    } catch (e) { setError(e instanceof Error ? e.message : 'Could not switch vehicles.'); await load(); }
-    finally { setBusy(false); }
-  };
-
-  const replacePhoto = async () => {
-    if (!token || !replacementId || !replacementPhoto || busy) return;
-    if (!/^image\/(jpeg|png)$/.test(replacementPhoto.type)) {
-      setError('Select a JPG or PNG photo.'); return;
-    }
-    setBusy(true); setError(''); setNotice('');
-    try {
-      const data = new FormData();
-      data.append('vehicle_photo', toUploadFile(replacementPhoto) as any);
-      const result = await api<{ message: string }>(`/vehicles/${replacementId}/photo`, { token, method: 'POST', form: data });
-      setNotice(result.message || 'Photo updated and sent for authorization review.');
-      setReplacementId(null); setReplacementPhoto(null);
-      await load();
-    } catch (e) { setError(e instanceof Error ? e.message : 'Could not replace the photo.'); }
-    finally { setBusy(false); }
-  };
-
-  return <Frame topInset={false} bottomPad={96}>
-    <NavyHeader pb={28}><T s={22} w="head" c={C.white}>My Vehicles & RFID</T><T s={12} c={C.blue300}>Registration, authorizations and entry selection</T></NavyHeader>
-    <View style={{ padding: 20, gap: 14 }}>
-      {licenseStatus === 'not_submitted' && <Card bg={C.amber50}><T s={13}>Submit your driver's license before registering a vehicle. A pending license does not authorize parking access.</T></Card>}
-      {!!error && <Card border={C.red200} bg={C.red50}><T s={13} c={C.red700}>{error}</T></Card>}
-      {!!notice && <Card bg={C.blue50}><T s={13} c={C.navy}>{notice}</T></Card>}
-      <Btn label="Refresh vehicles" icon={<RefreshCw color={C.white} size={16}/>} py={11} onPress={() => void load()} disabled={loading} />
-      {loading && <ActivityIndicator color={C.royal} />}
-      {!loading && vehicles.length === 0 && <T s={13} c={C.slate500}>No vehicles registered under your account yet.</T>}
-      {vehicles.map((vehicle, index) => {
-        const id = String(vehicle.id ?? vehicle.vehicle_id ?? '');
-        const approved = (vehicle.status ?? vehicle.authorization_status) === 'approved';
-        const eligible = !vehicle.selectedForUse && !vehicle.switchLocked && !!vehicle.rfid && approved && (!vehicle.registrationStatus || vehicle.registrationStatus === 'registered');
-        return <Card key={String(vehicle.id ?? vehicle.vehicle_id ?? index)} style={{ gap: 7 }}>
-          <T s={18} w="bold" c={C.navy}>{vehicle.plate ?? vehicle.plate_number ?? 'Vehicle'}</T>
-          <T s={13}>{[vehicle.make, vehicle.model, vehicle.color].filter(Boolean).join(' · ') || 'Vehicle details unavailable'}</T>
-          <T s={12}>Authorization: {vehicle.status ?? vehicle.authorization_status ?? 'Not requested'}</T>
-          {!!vehicle.rejectionReason && <T s={12} c={C.red700}>Correction requested: {vehicle.rejectionReason}</T>}
-          <T s={12}>RFID tag: {vehicle.rfid || 'Not assigned'}</T>
-          {vehicle.selectedForUse && <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}><CheckCircle size={16} color={C.green600}/><T s={13} c={C.green600}>Selected for entry</T></View>}
-          {vehicle.switchLocked && <T s={12} c={C.amber600}>Exit the parking area before switching vehicles.</T>}
-          {!vehicle.selectedForUse && <Btn label="Use this vehicle" py={10} disabled={!eligible || busy} onPress={() => void selectForUse(vehicle)} />}
-          {!vehicle.rfid && <T s={12} c={C.slate500}>PASS staff must assign an active RFID before vehicle selection.</T>}
-          {vehicle.canResubmit && <Btn label="Correct and resubmit vehicle details" py={10} bg={C.blue50} color={C.royal} disabled={busy}
-            onPress={() => { setResubmittingId(id);setForm({plate_number:vehicle.plate??vehicle.plate_number??'',vehicle_type:vehicle.type??vehicle.vehicle_type??'',year_model:String(vehicle.year??''),make:vehicle.make??'',model:vehicle.model??'',color:vehicle.color??''});setPhoto(null);setShowForm(true);setError(''); }} />}
-          {['pending', 'rejected'].includes(vehicle.status ?? vehicle.authorization_status ?? '') && <>
-            <Btn label={replacementId === id ? 'Hide photo replacement' : 'Replace vehicle photo'} py={10}
-              bg={C.blue50} color={C.royal} disabled={busy}
-              onPress={() => { setReplacementId(current => current === id ? null : id); setReplacementPhoto(null); setError(''); }} />
-            {replacementId === id && <View style={{ gap: 9 }}>
-              <T s={12}>Replacing a photo resets the authorization to pending staff review. This does not activate RFID.</T>
-              <FileUpload label="New vehicle photo (JPG/PNG)" file={replacementPhoto} onChange={setReplacementPhoto} onError={setError} />
-              <Btn label="Submit replacement for review" py={10} loading={busy} disabled={!replacementPhoto}
-                onPress={() => void replacePhoto()} />
-            </View>}
-          </>}
-        </Card>;
-      })}
-      <Btn label={showForm ? 'Hide registration form' : 'Register a vehicle'} py={12} disabled={licenseStatus === 'not_submitted'}
-        onPress={() => { setShowForm(value => !value); setResubmittingId(null);setForm(EMPTY);setPhoto(null);setError(''); }} bg={C.navy} />
-      {showForm && <Card style={{ gap: 13 }}>
-        <T s={17} w="bold" c={C.navy}>{resubmittingId?'Correct vehicle registration':'New vehicle'}</T>
-        <T s={12} c={C.slate500}>A clear photo showing the vehicle plate is required. Staff review—not automatic plate recognition—decides authorization. RFID assignment is separate.</T>
-        <FileUpload label="Vehicle photo (JPG/PNG)" file={photo} onChange={setPhoto} onError={setError} />
-        {!!photo && <Image source={{ uri: photo.uri }} resizeMode="contain" style={{ height: 170, backgroundColor: C.slate50, borderRadius: 10 }} />}
-        <T s={12} c={C.slate500}>Enter the plate exactly as printed and check every field. This Laravel version no longer exposes the old photo-reading endpoint.</T>
-        <Field label="Plate Number" autoCapitalize="characters" value={form.plate_number} onChangeText={value => setForm(previous => ({ ...previous, plate_number: value.toUpperCase() }))} placeholder="ABC-1234" />
-        <Select label="Vehicle Type" value={form.vehicle_type} placeholder="Select type" options={VEHICLE_TYPES.map(type => ({ label: type, value: type }))} onChange={value => setForm(previous => ({ ...previous, vehicle_type: value }))} />
-        <Field label="Model Year (optional)" value={form.year_model} onChangeText={value => setForm(previous => ({ ...previous, year_model: value }))} keyboardType="number-pad" placeholder="2024" />
-        <Field label="Make" value={form.make} onChangeText={value => setForm(previous => ({ ...previous, make: value }))} placeholder="Toyota" />
-        <Field label="Model" value={form.model} onChangeText={value => setForm(previous => ({ ...previous, model: value }))} placeholder="Vios" />
-        <Field label="Color" value={form.color} onChangeText={value => setForm(previous => ({ ...previous, color: value }))} placeholder="White" />
-        <Btn label={resubmittingId?'Submit corrections for staff review':'Submit vehicle registration'} disabled={busy} loading={busy} onPress={() => void register()} />
-      </Card>}
-    </View>
-  </Frame>;
+    const register = () => write(async () => {
+        if (!licenseEligible)
+            throw new Error('Check your verified, unexpired driver’s license before submitting.');
+        if (review.tone !== 'success')
+            throw new Error(review.message);
+        const result = await api<{
+            vehicle_id: number;
+            message: string;
+        }>(resubmittingId ? `/vehicles/${resubmittingId}/resubmit` : '/vehicles', {
+            token, method: 'POST', form: vehicleBody(form, orFile, crFile, photo), timeoutMs: 120000
+        });
+        if (!result.vehicle_id || typeof result.message !== 'string')
+            throw new Error('PASS returned an incomplete registration response. Refresh your vehicles before submitting again.');
+        if (alive.current) {
+            setNotice(result.message);
+            setShowForm(false);
+            setResubmittingId(null);
+            reset();
+            await load();
+        }
+    });
+    const select = (vehicle: Vehicle) => write(async () => {
+        const result = await api<{
+            message: string;
+        }>(`/vehicles/${vehicle.id ?? vehicle.vehicle_id}/select-for-use`, {
+            token, method: 'POST'
+        });
+        if (alive.current) {
+            setNotice(result.message);
+            await load();
+        }
+    });
+    const replacePhoto = () => write(async () => {
+        const problem = photoProblem(replacementPhoto, 'vehicle photo');
+        if (problem)
+            throw new Error(problem);
+        const body = new FormData();
+        body.append('vehicle_photo', toUploadFile(replacementPhoto!) as unknown as Blob, replacementPhoto!.name);
+        const result = await api<{
+            message: string;
+        }>(`/vehicles/${replacementId}/photo`, {
+            token, method: 'POST', form: body
+        });
+        if (alive.current) {
+            setNotice(result.message);
+            setReplacementId(null);
+            setReplacementPhoto(null);
+            await load();
+        }
+    });
+    return <Frame topInset={false} bottomPad={96}><NavyHeader pb={28}><T s={22} w="head" c={C.white}>My Vehicles &amp; RFID</T><T s={12} c={C.blue300}>OR/CR registration, status and entry selection</T></NavyHeader>
+  <View style={{
+        padding: 20, gap: 14
+    }}>
+    {!licenseEligible && <Card bg={C.amber50}><T s={13}>A verified, unexpired driver’s license is required before registering a vehicle. Check your license status first.</T></Card>}
+    {!!error && <Card border={C.red200} bg={C.red50}><T s={13} c={C.red700} accessibilityRole="alert">{error}</T></Card>}{!!notice && <Card bg={C.blue50}><T s={13} c={C.navy} accessibilityLiveRegion="polite">{notice}</T></Card>}
+    <Btn label="Refresh vehicles" icon={<RefreshCw color={C.white} size={16}/>} py={11} disabled={loading || busy} onPress={() => {
+        setError('');
+        void load();
+    }}/>{loading && <ActivityIndicator color={C.royal}/>}
+    <Field label="Find my vehicle" value={search} onChangeText={setSearch} maxLength={100} placeholder="Vehicle plate"/>
+    <Btn label="Search my vehicles" disabled={busy || loading} onPress={() => { setError(''); setPage(1); setAppliedSearch(search.trim()); }}/>
+    {!!selectedPlate && <T s={13} c={C.navy}>Selected for use: {selectedPlate}</T>}
+    {!loading && !error && !vehicles.length && <T s={13} c={C.slate500}>No vehicles registered under your account yet.</T>}
+    {vehicles.map((vehicle, index) => {
+            const id = String(vehicle.id ?? vehicle.vehicle_id ?? ''), approved = (vehicle.status ?? vehicle.authorization_status) === 'approved';
+            const eligible = !vehicle.selectedForUse && !vehicle.switchLocked && !!vehicle.rfid && vehicle.rfidStatus !== 'assigned' && approved && (!vehicle.registrationStatus || vehicle.registrationStatus === 'registered');
+            return <Card key={id || index} style={{
+                gap: 8
+            }}><T s={18} w="bold" c={C.navy}>{vehicle.plate ?? vehicle.plate_number ?? 'Vehicle'}</T><T s={13}>{[vehicle.make, vehicle.model, vehicle.color].filter(Boolean).join(' · ')}</T>
+        <T s={12}>Authorization: {vehicle.status ?? vehicle.authorization_status ?? 'Not requested'}</T>{!!vehicle.documentCheck && <T s={12}>Document check: {vehicle.documentCheck.status.replace(/_/g, ' ')}</T>}{vehicle.documentCheck?.reasons?.map((reason, i) => <T key={i} s={12} c={C.red700}>{reason}</T>)}{!!vehicle.rejectionReason && <T s={12} c={C.red700}>{vehicle.rejectionReason}</T>}
+        <T s={12}>RFID tag: {vehicle.rfid || 'Not assigned'}</T>{vehicle.rfidStatus === 'assigned' && <T s={12} c={C.amber800}>Collect your assigned sticker from PASS staff. It must be issued before entry.</T>}{vehicle.rfidStatus === 'pending_assignment' && <T s={12} c={C.amber800}>Approved; waiting for an available RFID sticker.</T>}
+        {vehicle.selectedForUse && <View style={{
+                flexDirection: 'row', gap: 6
+            }}><CheckCircle size={16} color={C.green600}/><T s={13} c={C.green600}>Selected vehicle</T></View>}{vehicle.switchLocked && <T s={12} c={C.amber800}>Record your parking exit before switching vehicles.</T>}
+        {!vehicle.selectedForUse && <Btn label="Use this vehicle" py={10} disabled={!eligible || busy} onPress={() => {
+                void select(vehicle);
+            }}/>}
+        {vehicle.canResubmit && <Btn label="Correct and resubmit OR/CR" py={10} bg={C.blue50} color={C.royal} disabled={busy || !licenseEligible} onPress={() => {
+                reset();
+                setResubmittingId(id);
+                setShowForm(true);
+            }}/>}
+        {['pending', 'rejected'].includes(vehicle.status ?? vehicle.authorization_status ?? '') && <><Btn label={replacementId === id ? 'Hide photo replacement' : 'Replace optional vehicle photo'} py={10} bg={C.blue50} color={C.royal} disabled={busy} onPress={() => {
+                    setReplacementId(replacementId === id ? null : id);
+                    setReplacementPhoto(null);
+                }}/>
+          {replacementId === id && <View style={{
+                    gap: 9
+                }}><T s={12}>The vehicle photo is for reference. Updating it does not approve a vehicle or issue RFID.</T><FileUpload label="New vehicle photo" file={replacementPhoto} onChange={setReplacementPhoto} onError={setError} imagesOnly disabled={busy}/><Btn label="Update vehicle photo" loading={busy} disabled={!replacementPhoto} onPress={() => {
+                    void replacePhoto();
+                }}/></View>}</>}
+      </Card>;
+        })}
+    {meta && <AdminPager page={meta.current_page} last={meta.last_page} total={meta.total} disabled={loading || busy} onChange={setPage}/>}
+    <Btn label={showForm ? 'Close registration form' : 'Register a vehicle'} py={12} disabled={busy || !showForm && !licenseEligible} bg={C.navy} onPress={() => {
+        reset();
+        setResubmittingId(null);
+        setShowForm(v => !v);
+    }}/>
+    {showForm && <Card style={{
+            gap: 14
+        }}><T s={17} w="bold" c={C.navy}>{resubmittingId ? 'Correct vehicle registration' : 'Register with your OR and CR'}</T><T s={12} c={C.slate600}>Photograph both documents. PASS fills the vehicle details; compare them with the originals. The server checks both photos again before automatic approval.</T>
+      <VehicleDocumentReview kind="OR" file={orFile} disabled={busy} onChange={file => choose('OR', file)} onReading={setOr} onError={setError}/><VehicleDocumentReview kind="CR" file={crFile} disabled={busy} onChange={file => choose('CR', file)} onReading={setCr} onError={setError}/>
+      <Card bg={review.tone === 'success' ? C.green50 : C.blue50}><T s={14} w="semibold">{review.title}</T><T s={12}>{review.message}</T>{review.basis.map((basis, i) => <T key={i} s={11} c={C.slate600}>{basis}</T>)}</Card>
+      <View pointerEvents={busy ? 'none' : 'auto'} style={{
+            gap: 11
+        }}>{DOCUMENT_DETAILS.map(key => <View key={key} style={{
+                gap: 5
+            }}>
+        {key === 'vehicle_type' ? <Select label={DETAIL_LABEL[key]} value={form[key]} options={TYPES.map(type => ({
+                label: type, value: type
+            }))} onChange={value => setEdits(v => ({
+                ...v, [key]: value
+            }))}/> : <Field label={DETAIL_LABEL[key]} accessibilityLabel={DETAIL_LABEL[key]} value={form[key]} editable={!busy} maxLength={key === 'plate_number' ? 20 : key === 'year_model' ? 4 : key === 'color' ? 50 : 100} keyboardType={key === 'year_model' ? 'number-pad' : 'default'} autoCapitalize="characters" onChangeText={value => setEdits(v => ({
+                ...v, [key]: value.toUpperCase()
+            }))}/>}
+        {!!sourceOf(key, reviewInput) && <T s={11} c={C.slate500}>{sourceOf(key, reviewInput)}</T>}{review.toCheck.includes(key) && <Pressable accessibilityRole="checkbox" accessibilityLabel={`Confirm ${DETAIL_LABEL[key]}`} accessibilityState={{
+                checked: checked[key] === form[key]
+            }} disabled={busy} onPress={() => setChecked(v => ({
+                ...v, [key]: form[key]
+            }))} style={{
+                paddingVertical: 9
+            }}><T s={12} c={C.royal}>□ I checked this value against the document.</T></Pressable>}
+      </View>)}</View>
+      <FileUpload label="Vehicle photo (optional)" file={photo} onChange={setPhoto} onError={setError} imagesOnly disabled={busy}/><Btn label={resubmittingId ? 'Submit corrected OR/CR' : 'Register vehicle'} disabled={busy || !licenseEligible || review.tone !== 'success'} loading={busy} onPress={() => {
+            void register();
+        }}/>
+    </Card>}
+  </View></Frame>;
 }

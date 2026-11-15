@@ -1,4 +1,4 @@
-import { getParkingAvailability, type ParkingArea } from '../services/parking';
+import { useParkingSnapshot } from '../hooks/useParkingSnapshot';
 import { getParkingHistory, type ParkingHistoryItem } from '../services/history';
 import { getAccessRecords, type AccessEvent } from '../services/accessRecords';
 import { api } from '../api/client';
@@ -17,64 +17,21 @@ const freeColor = (free: number) => (free < 5 ? C.red500 : free < 15 ? C.amber50
 
 function useLiveParking() {
   const { token, user } = useAuth();
-  const [areas, setAreas] = useState<ParkingArea[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [revision, setRevision] = useState(0);
-  const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
-
-  useEffect(() => {
-    let active = true;
-
-    if (!token || user?.role === 'guest') {
-      setAreas([]);
-      setError('Sign in with an authorized PASS account to view live parking availability.');
-      setLoading(false);
-      return () => {
-        active = false;
-      };
-    }
-
-    setLoading(true);
-    setError('');
-
-    getParkingAvailability(token)
-      .then((result) => {
-        if (active) { setAreas(result); setUpdatedAt(new Date()); }
-      })
-      .catch((err: unknown) => {
-        if (active) {
-          setError(
-            err instanceof Error
-              ? err.message
-              : 'Unable to load parking availability.',
-          );
-        }
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
-
-    return () => {
-      active = false;
-    };
-  }, [token, user?.role, revision]);
-
-  const zones = areas.flatMap((area) =>
-    (area.zones ?? []).map((zone) => ({
-      ...zone,
-      displayName: zone.zone_name || zone.zone_code,
-    })),
-  );
-
+  const snapshot = useParkingSnapshot({ token: user?.role==='guest'?null:token, role: user?.role ?? null });
+  const areas = snapshot.data?.areas ?? [];
   return {
-    zones: zones.length ? zones : areas.map(area => ({zone_id: area.parking_area_id, displayName: area.area_name, available: area.available, capacity: area.capacity, occupied: area.occupied, reserved: 0})),
-    loading,
-    error,
+    zones: areas.map(area => ({ zone_id: area.parking_area_id, displayName: area.area_name,
+      available: area.available, capacity: area.capacity, occupied: area.occupied,
+      maintenance: area.maintenance ?? 0, sensor_unavailable: area.sensor_unavailable ?? 0,
+      unverified_occupied: area.unverified_occupied ?? 0, recorded_occupied: area.recorded_occupied ?? 0 })),
+    loading: snapshot.loading, error: snapshot.error, fresh: snapshot.fresh,
     totalCapacity: areas.reduce((sum, area) => sum + area.capacity, 0),
     totalAvailable: areas.reduce((sum, area) => sum + area.available, 0),
-    updatedAt,
-    refresh: () => setRevision(value => value + 1),
+    totalOccupied: areas.reduce((sum, area) => sum + area.occupied, 0),
+    sensorUnavailable: areas.reduce((sum, area) => sum + (area.sensor_unavailable ?? 0), 0),
+    unverifiedOccupied: areas.reduce((sum, area) => sum + (area.unverified_occupied ?? 0), 0),
+    updatedAt: snapshot.data?.generated_at ? new Date(snapshot.data.generated_at) : null,
+    refresh: () => { void snapshot.refresh(); },
   };
 }
 
@@ -120,18 +77,24 @@ function ZoneBar({
 export function HomeScreen({ user, onNavigate, unreadCount = 0 }: { user: MobileUser; onNavigate: (s: MobileScreen) => void; unreadCount?: number }) {
   const { status: licenseStatus } = useLicense();
   const { token } = useAuth();
-  const [session, setSession] = useState<any[]>([]);
-  const [recent, setRecent] = useState<ParkingHistoryItem[]>([]);
+  const account = `${token ?? ''}|${user.role ?? ''}|${user.id}`;
+  const [sessionSource, setSession] = useState<{ account: string; rows: any[] }>({account,rows:[]});
+  const [recentSource, setRecent] = useState<{ account: string; rows: ParkingHistoryItem[] }>({account,rows:[]});
+  const session = sessionSource.account===account?sessionSource.rows:[];
+  const recent = recentSource.account===account?recentSource.rows:[];
   useEffect(() => {
-    if (!token || !['student','faculty','employee'].includes(user.role ?? '')) return;
-    api<{data:any[]}>('/parking/my-session', {token}).then(r => setSession(r.data ?? [])).catch(() => {});
-    getParkingHistory(token).then(h => setRecent(h.slice(0, 2))).catch(() => {});
-  }, [token, user.role]);
+    let active = true;
+    if (!token || !['student','faculty','employee'].includes(user.role ?? '')) return () => { active=false; };
+    api<{data:any[]}>('/parking/my-session', {token}).then(r => { if(active) setSession({account,rows:r.data ?? []}); }).catch(() => {});
+    getParkingHistory(token).then(h => { if(active) setRecent({account,rows:h.slice(0,2)}); }).catch(() => {});
+    return () => { active=false; };
+  }, [token, user.role, account]);
 
   const {
     zones: liveZones,
     loading: parkingLoading,
     error: parkingError,
+    fresh: parkingFresh, sensorUnavailable, unverifiedOccupied,
     totalAvailable: liveTotalAvailable,
   } = useLiveParking();
 
@@ -259,24 +222,27 @@ export function HomeScreen({ user, onNavigate, unreadCount = 0 }: { user: Mobile
           <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
             <T s={14} w="semibold" c={C.slate700}>Parking Available</T>
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-              <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: C.green500 }} />
-              <T s={12} w="semibold" c={C.green600}>{parkingLoading ? 'Loading...' : parkingError ? 'Unavailable' : `${totalFree} slots`}</T>
+              <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: parkingFresh ? C.green500 : C.amber500 }} />
+              <T s={12} w="semibold" c={parkingFresh?C.green600:C.amber800}>{!parkingFresh ? parkingError ? 'Unavailable' : 'Checking...' : `${totalFree} slots`}</T>
             </View>
           </View>
 
           <View style={{ gap: 10 }}>
             {parkingLoading && <T s={12} c={C.slate400}>Loading parking availability...</T>}
             {!!parkingError && <T s={12} c={C.red600}>{parkingError}</T>}
-            {!parkingLoading && !parkingError && liveZones.length === 0 && (
+            {!parkingLoading && !parkingError && parkingFresh && liveZones.length === 0 && (
               <T s={12} c={C.slate400}>No parking zones available.</T>
             )}
-            {liveZones.slice(0, 3).map((z) => (
+            {parkingFresh && liveZones.slice(0, 3).map((z) => (
               <View key={z.zone_id} style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
                 <T s={12} w="semibold" c={C.slate400} style={{ width: 48 }}>{z.displayName}</T>
                 <ZoneBar free={z.available} capacity={z.capacity} height={8} />
                 <T s={12} w="bold" c={C.slate600} style={{ width: 32, textAlign: 'right' }}>{z.available}</T>
               </View>
             ))}
+            {!parkingFresh && !parkingError && !parkingLoading && <T s={12} c={C.amber800}>Parking availability is waiting for a fresh server response.</T>}
+            {parkingFresh && !!sensorUnavailable && <T s={12} c={C.amber800}>{sensorUnavailable} mapped sensor slots are offline or uncertain.</T>}
+            {parkingFresh && !!unverifiedOccupied && <T s={12} c={C.amber800}>{unverifiedOccupied} occupancy detections have no recorded slot assignment. Sensor readings do not verify vehicle identity.</T>}
           </View>
         </Card>
 
@@ -302,10 +268,10 @@ export function HomeScreen({ user, onNavigate, unreadCount = 0 }: { user: Mobile
 }
 
 function ParkingAvailabilitySummaryScreen() {
-  const { zones, loading, error, totalCapacity, totalAvailable, updatedAt, refresh } = useLiveParking();
+  const { zones, loading, error, fresh, totalCapacity, totalAvailable, totalOccupied, sensorUnavailable, unverifiedOccupied, updatedAt, refresh } = useLiveParking();
   const capacity = totalCapacity;
   const free = totalAvailable;
-  const filled = capacity > 0 ? Math.max(0, Math.min(100, ((capacity - free) / capacity) * 100)) : 0;
+  const filled = capacity > 0 ? Math.max(0, Math.min(100, (totalOccupied / capacity) * 100)) : 0;
 
   return (
     <Frame topInset={false} bottomPad={28} refreshing={loading} onRefresh={refresh}>
@@ -325,22 +291,22 @@ function ParkingAvailabilitySummaryScreen() {
         <Card style={{ borderRadius: 23, padding: 21, shadowOpacity: 0.1, shadowRadius: 18, elevation: 4, gap: 15 }}>
           <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
             <T s={12} w="semibold" c={C.slate500} style={{ textTransform: 'uppercase', letterSpacing: 1 }}>Available spaces</T>
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, borderRadius: 99, paddingHorizontal: 10, paddingVertical: 6, backgroundColor: error ? C.red50 : C.green50 }}>
-              <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: error ? C.red500 : C.green500 }} />
-              <T s={11} w="semibold" c={error ? C.red600 : C.green700}>{error ? 'Unavailable' : loading ? 'Updating' : 'Server updated'}</T>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, borderRadius: 99, paddingHorizontal: 10, paddingVertical: 6, backgroundColor: error ? C.red50 : fresh ? C.green50 : C.amber50 }}>
+              <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: error ? C.red500 : fresh ? C.green500 : C.amber500 }} />
+              <T s={11} w="semibold" c={error ? C.red600 : fresh ? C.green700 : C.amber800}>{error ? 'Unavailable' : !fresh ? 'Checking current status' : 'Server updated'}</T>
             </View>
           </View>
           <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 6 }}>
-            <T s={51} w="head" c={C.navy} style={{ lineHeight: 60 }}>{error || (loading && !updatedAt) ? '—' : free}</T>
+            <T s={51} w="head" c={C.navy} style={{ lineHeight: 60 }}>{!fresh ? '—' : free}</T>
             <T s={14} c={C.slate500}>/ {capacity} total spaces</T>
           </View>
           <View style={{ gap: 10 }}>
             <View style={{ height: 10, backgroundColor: C.slate100, borderRadius: 99, overflow: 'hidden' }}>
-              <View style={{ height: '100%', width: `${filled}%`, backgroundColor: C.royal, borderRadius: 99 }} />
+              <View style={{ height: '100%', width: `${fresh?filled:0}%`, backgroundColor: C.royal, borderRadius: 99 }} />
             </View>
             <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
-              <T s={12} c={C.slate500}>{error ? 'Status not available' : `${Math.round(filled)}% occupied`}</T>
-              <T s={12} w="semibold" c={C.royal}>{error ? '—' : `${free} open`}</T>
+              <T s={12} c={C.slate500}>{!fresh ? 'Status not available' : `${Math.round(filled)}% occupied`}</T>
+              <T s={12} w="semibold" c={C.royal}>{!fresh ? '—' : `${free} open`}</T>
             </View>
           </View>
           {updatedAt && <T s={11} c={C.slate400}>Last synced at {updatedAt.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}</T>}
@@ -349,9 +315,9 @@ function ParkingAvailabilitySummaryScreen() {
         <View style={{ gap: 4 }}><T s={18} w="head" c={C.navy}>Parking zones</T><T s={12} c={C.slate500}>Live occupancy by area · Pull down to refresh</T></View>
         {loading && zones.length === 0 && <View style={{ paddingVertical: 20 }}><ActivityIndicator color={C.royal} /></View>}
         {!!error && <Card bg={C.red50} border={C.red200} style={{ gap: 8 }}><T s={13} w="semibold" c={C.red700}>We couldn't load parking status.</T><T s={12} c={C.red700}>{error}</T><Pressable accessibilityRole="button" onPress={refresh}><T s={13} w="semibold" c={C.royal}>Try again →</T></Pressable></Card>}
-        {!loading && !error && zones.length === 0 && <Card style={{ alignItems: 'center', paddingVertical: 25, gap: 8 }}><ParkingSquare size={27} color={C.royal} /><T s={14} w="semibold" c={C.navy}>No parking zones available</T><T s={12} c={C.slate500}>Check back when zones have been added to PASS.</T></Card>}
+        {!loading && !error && fresh && zones.length === 0 && <Card style={{ alignItems: 'center', paddingVertical: 25, gap: 8 }}><ParkingSquare size={27} color={C.royal} /><T s={14} w="semibold" c={C.navy}>No parking zones available</T><T s={12} c={C.slate500}>Check back when zones have been added to PASS.</T></Card>}
         <View style={{ gap: 11 }}>
-          {!error && zones.map(zone => {
+          {fresh && !error && zones.map(zone => {
             const percent = zone.capacity ? Math.max(0, Math.min(100, Math.round(zone.available / zone.capacity * 100))) : 0;
             return <Card key={zone.zone_id} style={{ padding: 17, borderRadius: 19, gap: 12 }}>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
@@ -361,7 +327,7 @@ function ParkingAvailabilitySummaryScreen() {
               </View>
               <ZoneBar free={zone.available} capacity={zone.capacity} height={9} />
               <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-                <T s={11} c={C.slate500}>{zone.occupied} occupied{zone.reserved > 0 ? ` · ${zone.reserved} reserved` : ''}</T><T s={11} w="semibold" c={freeColor(zone.available)}>{percent}% available</T>
+                <T s={11} c={C.slate500}>{zone.occupied} occupied · {zone.maintenance} maintenance · {zone.sensor_unavailable} sensor unavailable</T><T s={11} w="semibold" c={freeColor(zone.available)}>{percent}% available</T>
               </View>
             </Card>;
           })}

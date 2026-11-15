@@ -1,6 +1,6 @@
 /** Native, interactive rendering of the exact Laravel/web parking geometry. */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, AppState, PanResponder, Pressable, View } from 'react-native';
+import { ActivityIndicator, Alert, PanResponder, Pressable, View } from 'react-native';
 import Svg from 'react-native-svg';
 import { ArrowDownToLine, ArrowUpFromLine, Layers, Maximize2, RefreshCw, ZoomIn, ZoomOut } from 'lucide-react-native';
 import { api } from '../api/client';
@@ -9,9 +9,12 @@ import { Btn, Card, Field, Frame, T } from '../components/ui';
 import { Select } from '../components/Select';
 import { C } from '../theme';
 import { NavyHeader } from './shared';
-import { canOperateSlots, getParkingMap, slotColors, WEB_BAY_COUNTS, type MapSlot, type ParkingMapData, type Point } from '../services/parkingMap';
+import { canOperateSlots, hasRecordedHold, slotColors, WEB_BAY_COUNTS, type MapSlot, type ParkingMapData, type Point } from '../services/parkingMap';
 import { ParkingPlanNative, ParkingScene3DNative, project3D } from '../components/ParkingSceneNative';
 import ParkingWeb3DNative from '../components/ParkingWeb3DNative';
+import { useParkingSnapshot } from '../hooks/useParkingSnapshot';
+import { useGateNotice } from '../hooks/useGateNotice';
+import GateNoticePanel from '../components/GateNoticePanel';
 
 type ViewRect = [number, number, number, number];
 type DisplayMode = 'plan' | '3d';
@@ -83,7 +86,7 @@ function NativeLayout({ data, mode, area, selected, onSelect, onGate }: {
     onPanResponderTerminate: () => { pinchStart.current = null; },
   }), [full, viewWidth]);
 
-  const showPlates = camera[2] < 180;
+  const showPlates = !!data.hasStaffDetails && camera[2] < 180;
   const background = mode === 'plan' ? '#F8FAFC' : '#EEF2F7';
   const imageHeight = viewWidth > 600
     ? Math.max(260, Math.min(640, Math.round(viewWidth / 2.45)))
@@ -114,7 +117,7 @@ function ChoiceBar<T extends string>({ choices, value, change }: { choices: {key
   </View>;
 }
 
-const readDate = (value: string | null | undefined) => value ? new Date(value).toLocaleString() : '—';
+const readDate = (value: string | null | undefined) => value ? new Date(value).toLocaleString('en-PH', { timeZone: 'Asia/Manila' }) : '—';
 function Detail({ label, value }: {label:string;value:string}) {
   return <View style={{flexDirection:'row',paddingVertical:7,borderBottomWidth:1,borderBottomColor:C.slate100,gap:10}}>
     <T s={12} c={C.slate500} style={{width:104}}>{label}</T><T s={12} w="medium" c={C.slate700} style={{flex:1,textAlign:'right'}}>{value}</T>
@@ -124,9 +127,8 @@ function Detail({ label, value }: {label:string;value:string}) {
 /** The exact map endpoint determines which private fields each account can see. */
 export default function ParkingMapScreen({ back }: { back?: () => void }) {
   const { token, user } = useAuth();
-  const [data, setData] = useState<ParkingMapData|null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
+  const { data, fresh, loading, error, refresh: load } = useParkingSnapshot({ token, role: user?.role ?? null, privileged: true });
+  const { state: gateNotice, begin, approved, failed, finish } = useGateNotice();
   const [mode, setMode] = useState<DisplayMode>('3d');
   const [area, setArea] = useState<Area>('ALL');
   const [selectedId, setSelectedId] = useState<number|null>(null);
@@ -141,29 +143,16 @@ export default function ParkingMapScreen({ back }: { back?: () => void }) {
   const [gateDirection,setGateDirection] = useState<'entry'|'exit'>('entry');
   const [gateValue,setGateValue] = useState('');
   const [gateResult,setGateResult] = useState('');
-  const sequence = useRef(0);
-  const refreshing = useRef(false);
-  const load = useCallback(async (silent=false) => {
-    if (!token || refreshing.current) return;
-    refreshing.current = true;
-    const seq = ++sequence.current;
-    if (!silent) setLoading(true);
-    try {
-      const next = await getParkingMap(token,user?.role ?? null);
-      if (seq !== sequence.current) return;
-      setData(next); setError('');
-    } catch (e) { if (seq===sequence.current) setError(e instanceof Error?e.message:'Could not load parking map.'); }
-    finally { refreshing.current=false; if (seq===sequence.current) setLoading(false); }
-  },[token,user?.role]);
+  const account = `${token ?? ''}|${user?.role ?? ''}`;
+  const accountRef = useRef(account); accountRef.current = account;
+  const alive = useRef(true);
+  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
   useEffect(() => {
-    setData(null); setSelectedId(null); void load();
-    // The public /sync/revision marker is deliberately account-scoped. Poll
-    // the authoritative availability map for cross-account occupancy changes.
-    const interval = setInterval(() => { if (AppState.currentState==='active') void load(true); },5000);
-    return () => { clearInterval(interval); sequence.current++; };
-  },[load]);
+    setSelectedId(null); setTransactions([]); setReason(''); setObserved(''); setOtherTxn('');
+    setMessage(''); setGateResult(''); setGateValue(''); setShowGate(false); setBusy(false);
+  }, [account]);
   const selected = data?.slots.find(s => s.slot_id === selectedId) ?? null;
-  const canMutate = !!data?.hasStaffDetails && canOperateSlots(user?.role ?? null);
+  const canMutate = fresh && !!data?.hasStaffDetails && canOperateSlots(user?.role ?? null);
   useEffect(() => {
     setReason('');setObserved('');setOtherTxn('');setTransactions([]);
     if (!token || !canMutate || selectedId===null) return;
@@ -174,26 +163,40 @@ export default function ParkingMapScreen({ back }: { back?: () => void }) {
   },[token,canMutate,selectedId]);
   const mutation = async (path:string, method:'PATCH'|'POST', json:unknown) => {
     if (!token || busy || !canMutate) return;
+    const requestAccount = account;
     setBusy(true);setMessage('');
     try {
       const result=await api<{message?:string;status?:string}>(path,{token,method,json});
+      if (!alive.current || accountRef.current !== requestAccount) return;
       setMessage(result.message ?? 'PASS updated the parking record.');
       setSelectedId(null);await load(true);
-    } catch(e) { Alert.alert('PASS action failed',e instanceof Error?e.message:'The server rejected this action.'); }
-    finally {setBusy(false);}
+    } catch(e) { if (alive.current && accountRef.current === requestAccount) Alert.alert('PASS action failed',e instanceof Error?e.message:'The server rejected this action.'); }
+    finally {if (alive.current && accountRef.current === requestAccount) setBusy(false);}
   };
   const confirm=(title:string,path:string,method:'PATCH'|'POST',json:unknown)=>Alert.alert(title,'Save this change to the shared PASS parking database?',[
     {text:'Cancel',style:'cancel'},{text:'Confirm',onPress:()=>void mutation(path,method,json)},
   ]);
+  const gateBlocked = busy || gateNotice.busy || gateNotice.pending || gateNotice.reviewing;
   const gateSubmit=()=>{
-    if (!token || !canMutate || !gateValue.trim() || busy) return;
-    Alert.alert(`Record ${gateDirection}`,'Laravel will validate the credential and authorization before updating parking.',[
+    if (!token || !canMutate || !gateValue.trim() || gateBlocked) return;
+    const requestAccount = account, direction = gateDirection, credential = { [gateMethod]: gateValue.trim() };
+    Alert.alert(`Record ${direction}`,'Laravel will validate the credential and authorization before updating parking.',[
       {text:'Cancel',style:'cancel'}, {text:'Proceed',onPress:()=>{
+        if (!alive.current || accountRef.current !== requestAccount) return;
+        let ticket: ReturnType<typeof begin>;
+        try { ticket = begin(); } catch { return; }
         setBusy(true);setGateResult('');
-        api<{message:string;status:string;slot_code?:string}>(`/parking/${gateDirection}`,{token,method:'POST',json:{[gateMethod]:gateValue.trim()}})
-          .then(r=>{setGateResult(`${r.status}: ${r.message}${r.slot_code?` · Slot ${r.slot_code}`:''}`);setGateValue('');void load(true);})
-          .catch(e=>setGateResult(e instanceof Error?e.message:'Gate operation failed.'))
-          .finally(()=>setBusy(false));
+        api<{message:string;status:string;slot_code?:string;barrier_status?:string;barrier_command_id?:number}>(`/parking/${direction}`,{token,method:'POST',json:credential})
+          .then(r=>{
+            approved(ticket,r,direction);
+            if (!alive.current || accountRef.current !== requestAccount) return;
+            setGateResult(`${r.status}: ${r.message}${r.slot_code?` · Slot ${r.slot_code}`:''}`);setGateValue('');void load(true);
+          })
+          .catch(e=>{
+            failed(ticket,e);
+            if (alive.current && accountRef.current === requestAccount) setGateResult('Check the access record and gate notice before another action.');
+          })
+          .finally(()=>{finish(ticket);if (alive.current && accountRef.current === requestAccount) setBusy(false);});
       }},
     ]);
   };
@@ -209,18 +212,20 @@ export default function ParkingMapScreen({ back }: { back?: () => void }) {
     </NavyHeader>
     <View style={{padding:15,gap:13}}>
       {!!error && <Card bg={C.red50} border={C.red200}><T s={13} c={C.red700}>{data?'Map may be outdated. ':''}{error}</T><Btn label="Retry" py={9} onPress={()=>void load()}/></Card>}
+      {!fresh && <GateNoticePanel/>}
       {!!message && <Card bg={C.green50}><T s={13} c={C.green700}>{message}</T></Card>}
       {loading&&!data && <ActivityIndicator color={C.royal} size="large"/>}
-      {data && <>
+      {data && !fresh && !error && <Card bg={C.amber50}><T s={13} c={C.amber800}>Checking current parking status. Cached availability is hidden until the server confirms it.</T></Card>}
+      {data && fresh && <>
         <Card style={{gap:11}}>
           <ChoiceBar choices={[{key:'3d',label:'3D View'},{key:'plan',label:'Plan View'}]} value={mode} change={setMode}/>
           <ChoiceBar choices={[{key:'ALL',label:'Whole site'},{key:'MC',label:'Motorcycles'},{key:'CAR',label:'Cars'}]} value={area} change={next=>{setArea(next);setSelectedId(null);}} />
           <View style={{flexDirection:'row',flexWrap:'wrap',gap:9}}>
-            <T s={12} w="semibold" c={C.navy}>Web layout: {WEB_BAY_COUNTS.MC} motorcycles · {WEB_BAY_COUNTS.CAR} cars</T>
-            <T s={11} c={C.slate500}>All numbered bay positions supplied and verified by Laravel (M-01–M-84, C-01–C-45).</T>
+            <T s={12} w="semibold" c={C.navy}>Web proposal: {WEB_BAY_COUNTS.MC} motorcycles · {WEB_BAY_COUNTS.CAR} cars</T>
+            <T s={11} c={C.slate500}>Numbered bay positions supplied by the server’s measured proposal (M-01–M-84, C-01–C-45).</T>
           </View>
           <View style={{flexDirection:'row',flexWrap:'wrap',gap:11}}>
-            {([{color:'#22C55E',label:'Available'},{color:'#EF4444',label:'Occupied'},{color:'#9CA3AF',label:'Maintenance / disabled'}] as const).map(e=><View key={e.label} style={{flexDirection:'row',gap:5,alignItems:'center'}}><View style={{width:12,height:12,borderRadius:3,backgroundColor:e.color}}/><T s={11} c={C.slate600}>{e.label}</T></View>)}
+            {([{color:'#22C55E',label:'Available'},{color:'#EF4444',label:'Occupied'},{color:'#9CA3AF',label:'Maintenance / disabled'},{color:'#F59E0B',label:'Sensor unavailable'}] as const).map(e=><View key={e.label} style={{flexDirection:'row',gap:5,alignItems:'center'}}><View style={{width:12,height:12,borderRadius:3,backgroundColor:e.color}}/><T s={11} c={C.slate600}>{e.label}</T></View>)}
           </View>
           {mode==='3d'
             ? <ParkingWeb3DNative data={data} area={area} selectedId={selectedId} onSelect={s=>setSelectedId(s.slot_id)}
@@ -233,14 +238,21 @@ export default function ParkingMapScreen({ back }: { back?: () => void }) {
         <View style={{flexDirection:'row',gap:7,flexWrap:'wrap'}}>
           {groups.filter(g=>area==='ALL'||g.area_code===area).map(g=><Card key={g.parking_area_id} style={{flex:1,minWidth:143,gap:5,padding:12}}>
             <T s={12} w="semibold">{g.area_name}</T><T s={20} w="bold" c={C.navy}>{g.available} <T s={12} c={C.slate500}>/ {g.capacity} free</T></T>
-            <T s={11} c={C.slate500}>{g.occupied} occupied · {g.maintenance ?? 0} maintenance</T>
+            <T s={11} c={C.slate500}>{g.occupied} occupied · {g.maintenance ?? 0} maintenance · {g.sensor_unavailable ?? 0} sensor unavailable</T>
+            {!!g.unverified_occupied && <T s={11} c={C.amber800}>{g.unverified_occupied} sensor detection(s) without a recorded slot assignment</T>}
           </Card>)}
         </View>
         {selected && <Card style={{gap:10}}>
           <T s={18} w="head" c={C.navy}>Slot {selected.slot_code}</T>
-          <View style={{borderRadius:9,backgroundColor:slotColors(selected).fill,padding:12,alignItems:'center'}}><T s={17} w="bold" c={C.white}>{selected.status.toUpperCase()}</T>
+          <View style={{borderRadius:9,backgroundColor:slotColors(selected).fill,padding:12,alignItems:'center'}}><T s={17} w="bold" c={slotColors(selected).label}>{selected.status==='unknown'?'SENSOR UNAVAILABLE':selected.status.toUpperCase()}</T>
             {selected.status==='occupied' && selected.occupant?.confirmed===false && <T s={12} c={C.white}>Assigned position not confirmed</T>}
           </View>
+          {selected.status==='occupied' && !hasRecordedHold(selected) && <T s={12} c={C.amber800}>Sensor detected an object. Its vehicle identity is unverified; no parking entry is created by this reading.</T>}
+          {selected.status==='unknown' && <T s={12} c={C.amber800}>This mapped sensor is offline or uncertain. The slot is unavailable for a new assignment.</T>}
+          {selected.sensor && <>
+            <Detail label="Slot sensor" value={`${selected.sensor.state} · ${selected.sensor.online?'online':'offline'}`}/>
+            <Detail label="Sensor last seen" value={readDate(selected.sensor.last_seen_at)}/>
+          </>}
           <Detail label="Parking area" value={selected.area_name}/>
           <Detail label="Accessibility" value={selected.accessible?'PWD / accessible':'Standard bay'}/>
           <Detail label="Position" value={isPlaced(selected)?'Proposed layout position':'Not mapped / inventory only'}/>
@@ -272,17 +284,18 @@ export default function ParkingMapScreen({ back }: { back?: () => void }) {
         </Card>}
         {unplaced.length>0 && <Card style={{gap:8}}><T s={14} w="semibold">Unmapped slot inventory ({unplaced.length})</T>
           <T s={11} c={C.slate500}>These live PASS slot records have no position in the measured layout. No physical space is invented.</T>
-          <View style={{flexDirection:'row',flexWrap:'wrap',gap:5}}>{unplaced.map(s=><Pressable key={s.slot_id} onPress={()=>setSelectedId(s.slot_id)} style={{borderRadius:7,padding:6,backgroundColor:slotColors(s).fill}}><T s={11} c={C.white} w="bold">{s.slot_code}</T></Pressable>)}</View>
+          <View style={{flexDirection:'row',flexWrap:'wrap',gap:5}}>{unplaced.map(s=><Pressable key={s.slot_id} onPress={()=>setSelectedId(s.slot_id)} style={{borderRadius:7,padding:6,backgroundColor:slotColors(s).fill}}><T s={11} c={slotColors(s).label} w="bold">{s.slot_code}</T></Pressable>)}</View>
         </Card>}
         {!!data.ambiguities?.length && <Card style={{gap:5}}><T s={13} w="semibold">Layout notes</T>{data.ambiguities.map((note,i)=><T key={i} s={11} c={C.slate500}>• {note}</T>)}</Card>}
         {canMutate && <Card style={{gap:10}}>
+          <GateNoticePanel/>
           <Pressable onPress={()=>setShowGate(v=>!v)} style={{flexDirection:'row',alignItems:'center',gap:7}}><Layers size={16} color={C.royal}/><T s={15} w="semibold" c={C.navy}>{showGate?'Hide gate controls':'Main Entrance / Exit controls'}</T></Pressable>
           {showGate && <>
             <T s={12} c={C.slate500}>Record authorized RFID, visitor QR or staff plate override using the same server checks as web.</T>
             <ChoiceBar choices={[{key:'entry',label:'Entry'},{key:'exit',label:'Exit'}]} value={gateDirection} change={setGateDirection}/>
             <ChoiceBar choices={[{key:'rfid_tag_uid',label:'RFID'},{key:'qr_pass_code',label:'Visitor QR'},{key:'plate_number',label:'Plate override'}]} value={gateMethod} change={setGateMethod}/>
-            <Field label={gateMethod==='rfid_tag_uid'?'RFID UID':gateMethod==='qr_pass_code'?'QR pass code':'Plate number'} value={gateValue} onChangeText={setGateValue} autoCapitalize="characters"/>
-            <Btn label={`Record vehicle ${gateDirection}`} icon={gateDirection==='entry'?<ArrowDownToLine color={C.white} size={16}/>:<ArrowUpFromLine color={C.white} size={16}/>} disabled={busy||!gateValue.trim()} loading={busy} py={11} onPress={gateSubmit}/>
+            <Field accessibilityLabel="Gate credential" label={gateMethod==='rfid_tag_uid'?'RFID UID':gateMethod==='qr_pass_code'?'QR pass code':'Plate number'} value={gateValue} onChangeText={setGateValue} autoCapitalize="characters"/>
+            <Btn label={`Record vehicle ${gateDirection}`} icon={gateDirection==='entry'?<ArrowDownToLine color={C.white} size={16}/>:<ArrowUpFromLine color={C.white} size={16}/>} disabled={gateBlocked||!gateValue.trim()} loading={busy} py={11} onPress={gateSubmit}/>
             {!!gateResult && <T s={13} c={C.navy}>{gateResult}</T>}
           </>}
         </Card>}
